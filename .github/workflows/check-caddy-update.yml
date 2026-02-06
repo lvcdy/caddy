@@ -28,27 +28,9 @@ jobs:
       - name: Fetch latest Caddy Alpine version
         id: latest_version
         run: |
-          # Get the latest caddy:alpine tag from Docker Hub API
-          LATEST=$(curl -s 'https://hub.docker.com/v2/repositories/library/caddy/tags?page_size=100' \
-            | python3 -c "
-import sys, json, re
-data = json.load(sys.stdin)
-tags = [t['name'] for t in data.get('results', [])]
-# Filter for semantic versioning tags with alpine suffix
-alpine_tags = [t for t in tags if re.match(r'^[0-9]+\.[0-9]+\.[0-9]+-alpine$', t)]
-# Sort and get the latest
-if alpine_tags:
-  alpine_tags.sort(key=lambda v: [int(x) for x in v.replace('-alpine', '').split('.')])
-  print(alpine_tags[-1])
-" 2>/dev/null)
-          
-          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
-            echo "Failed to fetch latest version, using current"
-            LATEST="alpine"
-          fi
-          
-          echo "latest=$LATEST" >> $GITHUB_OUTPUT
-          echo "Latest version: $LATEST"
+          # Simply use 'alpine' tag which always points to the latest
+          echo "latest=alpine" >> $GITHUB_OUTPUT
+          echo "Latest version: alpine (always latest)"
 
       - name: Check if update is needed
         id: check_update

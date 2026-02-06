@@ -1,1 +1,1 @@
-FROM caddy:name:builderalpine-alpine
+FROM caddy:alpine
