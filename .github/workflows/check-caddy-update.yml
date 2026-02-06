@@ -1,0 +1,103 @@
+name: Check Caddy Update
+
+on:
+  schedule:
+    # Runs at 00:00 UTC on the first day of every month
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current Caddy version from Dockerfile
+        id: current_version
+        run: |
+          CURRENT=$(grep -oP 'FROM caddy:\K[^ ]+' Dockerfile | head -1)
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT"
+
+      - name: Fetch latest Caddy Alpine version
+        id: latest_version
+        run: |
+          # Get the latest caddy:alpine tag from Docker Hub
+          LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/caddy/tags \
+            | grep -o '"name":"[^"]*"' \
+            | grep -o '[^"]*' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-alpine$' \
+            | sort -V | tail -1)
+          
+          if [ -z "$LATEST" ]; then
+            # Fallback: get the latest alpine version without patch
+            LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/caddy/tags \
+              | grep -o '"name":"[^"]*-alpine"' \
+              | tr -d '"-' \
+              | sed 's/-alpine//' \
+              | sort -V | tail -1)
+            LATEST="${LATEST}-alpine"
+          fi
+          
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest version: $LATEST"
+
+      - name: Check if update is needed
+        id: check_update
+        run: |
+          CURRENT="${{ steps.current_version.outputs.current }}"
+          LATEST="${{ steps.latest_version.outputs.latest }}"
+          
+          echo "Comparing: current=$CURRENT vs latest=$LATEST"
+          
+          if [ "$CURRENT" != "$LATEST" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+            echo "Update needed: $CURRENT → $LATEST"
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+            echo "Already on latest version: $LATEST"
+          fi
+
+      - name: Update Dockerfile
+        if: steps.check_update.outputs.update_needed == 'true'
+        env:
+          LATEST_VERSION: ${{ steps.latest_version.outputs.latest }}
+        run: |
+          sed -i "s/FROM caddy:.*/FROM caddy:$LATEST_VERSION/" Dockerfile
+          echo "Updated Dockerfile with version: $LATEST_VERSION"
+          cat Dockerfile
+
+      - name: Configure git user
+        if: steps.check_update.outputs.update_needed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Commit and push changes
+        if: steps.check_update.outputs.update_needed == 'true'
+        run: |
+          git add Dockerfile
+          git commit -m "chore: update caddy image to ${{ steps.latest_version.outputs.latest }}"
+          git push origin ${{ github.ref }}
+
+      - name: Create Pull Request
+        if: steps.check_update.outputs.update_needed == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          commit-message: "chore: update caddy image to ${{ steps.latest_version.outputs.latest }}"
+          title: "chore: update caddy image to ${{ steps.latest_version.outputs.latest }}"
+          body: |
+            ## Caddy Image Update
+            
+            Automated update of Caddy base image version.
+            
+            - **Current version**: ${{ steps.current_version.outputs.current }}
+            - **Latest version**: ${{ steps.latest_version.outputs.latest }}
+            
+            Please review and merge if everything looks good.
+          branch: caddy-update-${{ github.run_number }}
+          delete-branch: true
