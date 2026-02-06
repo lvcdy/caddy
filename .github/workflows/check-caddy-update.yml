@@ -6,6 +6,10 @@ on:
     - cron: '0 0 1 * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   check-and-update:
     runs-on: ubuntu-latest
@@ -13,8 +17,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Get current Caddy version from Dockerfile
         id: current_version
@@ -26,21 +28,23 @@ jobs:
       - name: Fetch latest Caddy Alpine version
         id: latest_version
         run: |
-          # Get the latest caddy:alpine tag from Docker Hub
-          LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/caddy/tags \
-            | grep -o '"name":"[^"]*"' \
-            | grep -o '[^"]*' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-alpine$' \
-            | sort -V | tail -1)
+          # Get the latest caddy:alpine tag from Docker Hub API
+          LATEST=$(curl -s 'https://hub.docker.com/v2/repositories/library/caddy/tags?page_size=100' \
+            | python3 -c "
+import sys, json, re
+data = json.load(sys.stdin)
+tags = [t['name'] for t in data.get('results', [])]
+# Filter for semantic versioning tags with alpine suffix
+alpine_tags = [t for t in tags if re.match(r'^[0-9]+\.[0-9]+\.[0-9]+-alpine$', t)]
+# Sort and get the latest
+if alpine_tags:
+  alpine_tags.sort(key=lambda v: [int(x) for x in v.replace('-alpine', '').split('.')])
+  print(alpine_tags[-1])
+" 2>/dev/null)
           
-          if [ -z "$LATEST" ]; then
-            # Fallback: get the latest alpine version without patch
-            LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/caddy/tags \
-              | grep -o '"name":"[^"]*-alpine"' \
-              | tr -d '"-' \
-              | sed 's/-alpine//' \
-              | sort -V | tail -1)
-            LATEST="${LATEST}-alpine"
+          if [ -z "$LATEST" ] || [ "$LATEST" = "None" ]; then
+            echo "Failed to fetch latest version, using current"
+            LATEST="alpine"
           fi
           
           echo "latest=$LATEST" >> $GITHUB_OUTPUT
@@ -67,22 +71,21 @@ jobs:
         env:
           LATEST_VERSION: ${{ steps.latest_version.outputs.latest }}
         run: |
-          sed -i "s/FROM caddy:.*/FROM caddy:$LATEST_VERSION/" Dockerfile
-          echo "Updated Dockerfile with version: $LATEST_VERSION"
-          cat Dockerfile
+          # Only update if version is valid (contains alphanumeric and dots/dashes)
+          if [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpine$ ]] || [[ "$LATEST_VERSION" = "alpine" ]]; then
+            sed -i "s|FROM caddy:[^ ]*|FROM caddy:$LATEST_VERSION|" Dockerfile
+            echo "Updated Dockerfile with version: $LATEST_VERSION"
+            cat Dockerfile
+          else
+            echo "ERROR: Invalid version format: $LATEST_VERSION"
+            exit 1
+          fi
 
       - name: Configure git user
         if: steps.check_update.outputs.update_needed == 'true'
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-
-      - name: Commit and push changes
-        if: steps.check_update.outputs.update_needed == 'true'
-        run: |
-          git add Dockerfile
-          git commit -m "chore: update caddy image to ${{ steps.latest_version.outputs.latest }}"
-          git push origin ${{ github.ref }}
 
       - name: Create Pull Request
         if: steps.check_update.outputs.update_needed == 'true'
