@@ -28,13 +28,27 @@ jobs:
         uses: actions/checkout@v4
 
       # 自动抓取最新的 OWASP CRS 规则集（保证每月构建都是最新的病毒库）
+      # 自动抓取最新的 WAF 基础配置和 OWASP CRS 规则集
       - name: Prepare OWASP CRS
         run: |
-          wget https://raw.githubusercontent.com/corazawaf/coraza/v3/coraza.conf-recommended -O coraza.conf
+          # 1. 下载 Coraza 推荐的基础配置文件 (修正后的链接)
+          wget https://raw.githubusercontent.com/corazawaf/coraza/main/coraza.conf-recommended -O coraza.conf
+          
+          # 2. 将配置文件的引擎模式改为拦截 (默认是 DetectionOnly，仅检测不拦截)
+          sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' coraza.conf
+          
+          # 3. 下载 OWASP 核心规则集 (CRS)
           git clone --depth 1 https://github.com/corazawaf/coraza-coreruleset.git
+          
+          # 4. 准备 crs-setup.conf
           cp coraza-coreruleset/crs-setup.conf.example crs-setup.conf
+          
+          # 5. 提取规则文件
           mkdir -p rules
           cp coraza-coreruleset/rules/*.conf rules/
+          
+          # 6. 清理临时目录
+          rm -rf coraza-coreruleset
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
