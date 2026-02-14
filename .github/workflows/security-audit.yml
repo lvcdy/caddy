@@ -1,0 +1,62 @@
+name: 🔐 WAF Security Audit
+
+on:
+  pull_request:
+    paths:
+      - '.crs-version'
+      - '.github/workflows/update-crs.yml'
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Get version change
+        id: versions
+        run: |
+          PREV=$(git show ${{ github.event.pull_request.base.sha }}:.crs-version 2>/dev/null || echo "unknown")
+          NEW=$(cat .crs-version 2>/dev/null || echo "unknown")
+          echo "previous_version=$PREV" >> $GITHUB_OUTPUT
+          echo "new_version=$NEW" >> $GITHUB_OUTPUT
+          echo "Version change: $PREV → $NEW"
+
+      - name: Fetch CRS changelog
+        id: changelog
+        run: |
+          if [ "${{ steps.versions.outputs.new_version }}" != "unknown" ]; then
+            curl -s "https://api.github.com/repos/coreruleset/coreruleset/releases/tags/${{ steps.versions.outputs.new_version }}" \
+              | jq -r '.body' > CRS_CHANGELOG.md
+            echo "Changelog saved to CRS_CHANGELOG.md"
+          fi
+
+      - name: Create security review comment
+        uses: thollander/actions-comment-pull-request@v2
+        with:
+          message: |
+            ## 🔒 CRS Update Security Review
+            
+            **Version change**: `${{ steps.versions.outputs.previous_version }}` → `${{ steps.versions.outputs.new_version }}`
+            
+            ### 📋 Required validation checklist
+            - [ ] Review [CRS changelog](https://github.com/coreruleset/coreruleset/releases/tag/${{ steps.versions.outputs.new_version }})
+            - [ ] Test critical endpoints with updated rules
+            - [ ] Verify no false positives on legitimate traffic
+            - [ ] Check for deprecated rule IDs in changelog
+            - [ ] Confirm anomaly scoring thresholds still appropriate
+            
+            ### 📄 Changelog excerpt
+            ```markdown
+             $ (cat CRS_CHANGELOG.md 2>/dev/null | head -50)
+            ```
+            
+            > ℹ️ **Security team note**: CRS updates may introduce new blocking rules. Always validate in staging before production deployment. Contact security team if unsure.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
