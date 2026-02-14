@@ -1,101 +1,190 @@
-name: 🔒 Auto-Update OWASP CRS Rules
+name: Build and Push Caddy WAF to GHCR
 
 on:
+  push:
+    branches: [ "main" ]
+    tags: [ 'v*' ]
   schedule:
-    - cron: '0 3 * * 1'  # 每周一 UTC 03:00 检查更新
+    - cron: '25 3 1 * *'  # 每月1日 UTC 03:25（使用最新CRS）
   workflow_dispatch:
     inputs:
-      target_version:
-        description: '指定更新到的CRS版本 (留空则使用最新版)'
-        required: false
-        type: string
+      platforms:
+        description: '构建平台 (默认仅amd64，多平台构建会显著增加时间)'
+        type: choice
+        options: 
+          - linux/amd64
+          - linux/amd64,linux/arm64
+        default: linux/amd64
+      force_latest_crs:
+        description: '强制使用最新CRS规则（跳过版本文件）'
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  CADDY_VERSION: 2.10.2
+  CORAZA_VERSION: v2.1.0
 
 jobs:
-  check-and-update:
+  build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
+      packages: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get current CRS version
-        id: current
+      # 读取CRS版本（支持手动覆盖）
+      - name: Determine CRS version
+        id: crs-version
         run: |
-          CURRENT=$(cat .crs-version 2>/dev/null || echo "v4.15.0")
-          echo "current_version=$CURRENT" >> $GITHUB_OUTPUT
-          echo "Current CRS version: $CURRENT"
-
-      - name: Fetch latest CRS release
-        id: latest
-        run: |
-          if [ -n "${{ github.event.inputs.target_version }}" ]; then
-            LATEST="${{ github.event.inputs.target_version }}"
-            echo "Using specified version: $LATEST"
+          if [ "${{ github.event.inputs.force_latest_crs }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Using LATEST CRS for security-critical build"
+            echo "CRS_VERSION=latest" >> $GITHUB_ENV
           else
-            # 获取最新正式发布版本（跳过预发布）
-            LATEST=$(curl -s https://api.github.com/repos/coreruleset/coreruleset/releases/latest | \
-              jq -r '.tag_name // empty' | head -1)
-            if [ -z "$LATEST" ]; then
-              echo "Error: Failed to fetch latest CRS version"
-              exit 1
+            if [ -f .crs-version ]; then
+              CRS_VER=$(cat .crs-version | tr -d '[:space:]')
+              echo "CRS_VERSION=$CRS_VER" >> $GITHUB_ENV
+              echo "Loaded CRS version: $CRS_VER"
+            else
+              echo "CRS_VERSION=v4.15.0" >> $GITHUB_ENV  # 安全回退
+              echo "Warning: .crs-version not found, using fallback version"
             fi
           fi
-          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
-          echo "Latest CRS version: $LATEST"
 
-      - name: Compare versions
-        id: compare
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache Caddy binary
+        id: cache-caddy
+        uses: actions/cache@v3
+        with:
+          path: |
+            ./builder/linux_amd64/caddy
+            ./builder/linux_arm64/caddy
+          key: caddy-bin-${{ env.CADDY_VERSION }}-${{ env.CORAZA_VERSION }}-${{ hashFiles('Dockerfile') }}
+          restore-keys: |
+            caddy-bin-${{ env.CADDY_VERSION }}-${{ env.CORAZA_VERSION }}-
+
+      - name: Cache CRS rules
+        id: cache-crs
+        uses: actions/cache@v3
+        with:
+          path: ./crs
+          key: crs-${{ env.CRS_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            crs-${{ env.CRS_VERSION }}-
+            crs-
+
+      - name: Prepare OWASP CRS
+        if: steps.cache-crs.outputs.cache-hit != 'true'
         run: |
-          if [ "${{ steps.current.outputs.current_version }}" = "${{ steps.latest.outputs.latest_version }}" ]; then
-            echo "No update needed. Current version is up-to-date."
-            echo "update_needed=false" >> $GITHUB_OUTPUT
+          mkdir -p crs/rules
+          
+          # 1. 下载 Coraza 主配置
+          wget https://raw.githubusercontent.com/corazawaf/coraza/main/coraza.conf-recommended -O crs/coraza.conf
+          sed -i 's/SecRuleEngine DetectionOnly/SecRuleEngine On/' crs/coraza.conf
+          echo -e "\n# Load OWASP CRS configuration\nInclude /etc/caddy/coraza/crs-setup.conf" >> crs/coraza.conf
+          
+          # 2. 克隆 CRS (支持 latest 或指定版本)
+          if [ "${{ env.CRS_VERSION }}" = "latest" ]; then
+            git clone --depth 1 https://github.com/coreruleset/coreruleset.git crs-src
           else
-            echo "Update needed! ${steps.current.outputs.current_version} → ${steps.latest.outputs.latest_version}"
-            echo "update_needed=true" >> $GITHUB_OUTPUT
-            echo "old_version=${{ steps.current.outputs.current_version }}" >> $GITHUB_OUTPUT
-            echo "new_version=${{ steps.latest.outputs.latest_version }}" >> $GITHUB_OUTPUT
+            git clone --depth 1 --branch ${{ env.CRS_VERSION }} https://github.com/coreruleset/coreruleset.git crs-src
+          fi
+          
+          # 3. 配置 CRS
+          cp crs-src/crs-setup.conf.example crs/crs-setup.conf
+          sed -i '
+            /setvar:tx.rule_dir=/ {
+              s|^#||; 
+              s|/path/to/owasp-modsecurity-crs/rules|/etc/caddy/coraza/rules|
+            };
+            /tx\.anomaly_score_threshold/s/^#//;
+            /tx\.critical_anomaly_score/s/^#//;
+            /tx\.error_anomaly_score/s/^#//;
+            /tx\.warning_anomaly_score/s/^#//
+          ' crs/crs-setup.conf
+          
+          # 4. 复制规则
+          cp crs-src/rules/*.conf crs/rules/
+          rm -rf crs-src
+          
+          # 5. 记录实际使用的CRS版本（用于审计）
+          if [ -f crs-src/.git/refs/heads/main ]; then
+            git -C crs-src rev-parse HEAD > crs/VERSION_COMMIT 2>/dev/null || echo "${{ env.CRS_VERSION }}" > crs/VERSION_COMMIT
+          else
+            echo "${{ env.CRS_VERSION }}" > crs/VERSION_COMMIT
           fi
 
-      - name: Update CRS version file
-        if: steps.compare.outputs.update_needed == 'true'
+      - name: Build Caddy binaries (if not cached)
+        if: steps.cache-caddy.outputs.cache-hit != 'true'
         run: |
-          echo "${{ steps.latest.outputs.latest_version }}" > .crs-version
-          cat .crs-version
+          mkdir -p builder/linux_amd64 builder/linux_arm64
+          
+          # AMD64 构建
+          docker run --rm \
+            -v $(pwd)/builder/linux_amd64:/output \
+            -e CGO_ENABLED=0 \
+            -e GOOS=linux \
+            -e GOARCH=amd64 \
+            caddy:${{ env.CADDY_VERSION }}-builder \
+            sh -c "xcaddy build \
+              --with github.com/corazawaf/coraza-caddy/${{ env.CORAZA_VERSION }} \
+              --output /output/caddy"
+          
+          # 条件性 ARM64 构建
+          if [[ "${{ github.event.inputs.platforms || 'linux/amd64' }}" == *"linux/arm64"* ]]; then
+            docker run --rm \
+              -v $(pwd)/builder/linux_arm64:/output \
+              -e CGO_ENABLED=0 \
+              -e GOOS=linux \
+              -e GOARCH=arm64 \
+              caddy:${{ env.CADDY_VERSION }}-builder \
+              sh -c "xcaddy build \
+                --with github.com/corazawaf/coraza-caddy/${{ env.CORAZA_VERSION }} \
+                --output /output/caddy"
+          fi
 
-      - name: Create Pull Request
-        if: steps.compare.outputs.update_needed == 'true'
-        uses: peter-evans/create-pull-request@v5
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore(security): update OWASP CRS to ${{ steps.latest.outputs.latest_version }}"
-          branch: "update/crs-${{ steps.latest.outputs.latest_version }}"
-          delete-branch: true
-          title: "🔒 Update OWASP CRS to ${{ steps.latest.outputs.latest_version }}"
-          body: |
-            ## 📌 CRS Update Summary
-            - **Previous version**: `${{ steps.compare.outputs.old_version }}`
-            - **New version**: `${{ steps.latest.outputs.latest_version }}`
-            - **Release notes**: https://github.com/coreruleset/coreruleset/releases/tag/${{ steps.latest.outputs.latest_version }}
-            
-            ## 🔍 Changes to verify
-            - [ ] No increase in false positives (test with your traffic patterns)
-            - [ ] Critical business endpoints still accessible
-            - [ ] Check [CRS changelog](https://github.com/coreruleset/coreruleset/blob/${{ steps.latest.outputs.latest_version }}/CHANGES.md) for breaking changes
-            - [ ] Run security scan: `docker run --rm ghcr.io/${{ github.repository }}:test caddy validate`
-            
-            ## ⚠️ Security note
-            This update includes rules for:
-            ```bash
-            curl -s https://api.github.com/repos/coreruleset/coreruleset/releases/tags/ $ {{ steps.latest.outputs.latest_version }} | jq -r '.body'
-            ```
-            
-            *This PR was created automatically by GitHub Actions. Merge only after validation.*
-          labels: security, dependencies, automated-pr
-          reviewers: ${{ github.repository_owner }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: No update needed
-        if: steps.compare.outputs.update_needed != 'true'
-        run: echo "✅ CRS is already up-to-date. No action required."
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=monthly,enable=${{ github.event_name == 'schedule' }}
+            type=sha,prefix=,suffix=,format=short
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            CADDY_VERSION=${{ env.CADDY_VERSION }}
