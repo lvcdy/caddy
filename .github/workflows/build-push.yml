@@ -1,4 +1,4 @@
-name: Build Caddy WAF (AMD64/Alpine)
+name: Build Caddy WAF
 
 on:
   push:
